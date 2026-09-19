@@ -4,10 +4,12 @@ Montgomery County DPS CAD feed relay service for MeshCore Bot
 """
 
 import asyncio
+from shutil import copy
 from ..montco_helper import MontCoDispatch
 from .base_service import BaseServicePlugin
 from typing import Any, Optional
 from datetime import datetime, timezone, MINYEAR
+import copy
 
 METADATA_KEY_LAST_POSTED_TIME = "dps_last_posted_time"
 
@@ -74,7 +76,15 @@ class MontCoPublicSafetyService(BaseServicePlugin):
 
         self._running = False
         self._subscriptions = {}
+        self._municipality_lookup = {m.upper(): m for m in self.municipalities}
         self.logger.info("MontCoPublicSafetyService initialization complete")
+
+    def _normalize_municipality_name(self, municipality: str) -> str:
+        """Return the canonical municipality name for a user-entered value."""
+        cleaned = (municipality or "").strip()
+        if not cleaned:
+            return ""
+        return self._municipality_lookup.get(cleaned.upper(), "")
 
     async def start(self) -> None:
         if not self.enabled:
@@ -82,13 +92,12 @@ class MontCoPublicSafetyService(BaseServicePlugin):
             return
 
         self.logger.info("Starting MontCoPublicSafetyService...")
-        # self.bot.meshcore.subscribe(EventType.CHANNEL_MSG_RECV, self._on_mesh_channel_message)
-        #self.logger.info("Subscribed to CHANNEL_MSG_RECV events")
+        self.bot.meshcore.subscribe(EventType.CHANNEL_MSG_RECV, self._on_mesh_channel_message)
+        self.logger.info("Subscribed to CHANNEL_MSG_RECV events")
 
         self._running = True
         self._montco = MontCoDispatch()
         await self._montco.refresh()
-        self._montco.add_listener("LOWER SALFORD", 28800) 
 
         section = "MontCo_DPS_Service"
         self.channel = self.bot.config.get(section, "channel", fallback="#montco")
@@ -112,8 +121,77 @@ class MontCoPublicSafetyService(BaseServicePlugin):
         self.logger.info("MontCoPublicSafetyService stopped")
 
     async def _on_mesh_channel_message(self, event, metadata=None) -> None:
-        # Handle incoming channel messages if needed
-        pass
+        try:
+            payload = copy.deepcopy(event.payload) if hasattr(event, 'payload') else None
+            if payload is None:
+                self.logger.warning("Channel message event has no payload")
+                return
+
+            channel_idx = payload.get('channel_idx', 0)
+            channel_name = self.bot.channel_manager.get_channel_name(channel_idx)
+            if channel_name != self.channel:
+                self.logger.debug("Ignoring message from channel %s (not %s)", channel_name, self.channel)
+                return
+
+            text = payload.get('text', '')
+            sender = 'Unknown'
+            command = ''
+
+            if ':' in text and not text.startswith('http'):
+                parts = text.split(':', 1)
+                sender = parts[0].strip()
+                command = parts[1].strip()
+
+            # Command should be in the format of "dps [hours] [municipality],[(opt)municipality]"
+            # Hours are integers, municipalities are strings, and municipalities can have spaces in their names
+            # and must be in the list of municipalities defined in the service.
+            if command:
+                command = command.strip()
+                if command.lower().startswith("dps"):
+                    command = command[3:].strip()
+                if not command:
+                    self.logger.warning("Invalid command format: %s", command)
+                else:
+                    parts = command.split(None, 1)
+                    if len(parts) == 2:
+                        try:
+                            hours = int(parts[0])
+                            if hours > 4:
+                                self.logger.warning("Ignoring command with hours > 4: %s", command)
+                                await self.bot.command_manager.send_channel_message(
+                                    self.channel,
+                                    f"Cannot add listener for more than 4 hours. Ignoring command: {command}",
+                                    scope=self.get_mesh_flood_scope()
+                                )
+                                return
+                            raw_municipalities = [m.strip() for m in parts[1].split(',') if m.strip()]
+                            if not raw_municipalities:
+                                self.logger.warning("Invalid command format: %s", command)
+                                return
+
+                            for raw_municipality in raw_municipalities:
+                                municipality = self._normalize_municipality_name(raw_municipality)
+                                if not municipality:
+                                    self.logger.warning("Ignoring unknown municipality: %s", raw_municipality)
+                                    continue
+                                self._montco.add_listener(municipality.upper(), hours * 3600)
+                                self.logger.info("Added listener for %s for %d hours", municipality, hours)
+                                await self.bot.command_manager.send_channel_message(
+                                    self.channel,
+                                    f"Added listener for {municipality} for {hours} hours",
+                                    scope=self.get_mesh_flood_scope()
+                                )
+                        except ValueError:
+                            self.logger.warning("Invalid command format: %s", command)
+                    else:
+                        self.logger.warning("Invalid command format: %s", command)
+
+            if not channel_name or channel_name.lower() in ('dm', 'direct', 'private'):
+                self.logger.debug("Ignoring DM (DMs are never bridged)")
+                return
+
+        except Exception as e:
+            self.logger.error(f"Error handling mesh channel message: {e}", exc_info=True)
 
     async def _send_startup_message(self):
         try:
